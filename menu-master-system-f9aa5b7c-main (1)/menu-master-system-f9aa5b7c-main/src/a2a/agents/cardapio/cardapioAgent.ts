@@ -1,5 +1,6 @@
 import { registerA2AMethod, A2AMethodHandler } from '@/a2a/core/handler';
 import { A2AMessageSendParams, A2AMessage, A2AMessagePart, A2AAgentProfile } from '@/types/integrations';
+import { z } from 'zod';
 
 const AGENT_ID_PREFIX = 'cardapio-agent'; // Prefixo para identificar instâncias deste agente
 
@@ -39,14 +40,33 @@ const handleMessageSend: A2AMethodHandler = async (params: A2AMessageSendParams,
  * Handler para o método A2A 'cardapio/getMenuDetails'.
  * Retorna detalhes de um cardápio específico.
  */
-const handleGetMenuDetails: A2AMethodHandler = async (params: { menuId?: string }, agentId: string) => {
-  console.log(`[CardapioAgent:${agentId}] Chamado cardapio/getMenuDetails com params:`, params);
-  const menuId = params.menuId || 'menu-123'; // Pega um ID padrão se nenhum for fornecido
-  const menu = menuDatabase[menuId];
-  if (menu) {
-    return menu;
+const GetMenuDetailsParamsSchema = z.object({
+  menuId: z.string().optional(), // menuId é opcional
+});
+
+const handleGetMenuDetails: A2AMethodHandler = async (params: unknown, agentId: string) => {
+  try {
+    const validatedParams = GetMenuDetailsParamsSchema.parse(params);
+    console.log(`[CardapioAgent:${agentId}] Chamado cardapio/getMenuDetails com params:`, validatedParams);
+    const menuId = validatedParams.menuId || 'menu-123';
+    // ... restante da lógica do handler
+    const menu = menuDatabase[menuId];
+    if (menu) {
+      return menu;
+    }
+    throw { code: 1001, message: `Cardápio com ID '${menuId}' não encontrado.`, data: { requestedMenuId: menuId } };
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error(`[CardapioAgent:${agentId}] Erro de validação em cardapio/getMenuDetails:`, error.errors);
+      throw { code: -32602, message: 'Parâmetros inválidos.', data: error.format() };
+    }
+    console.error(`[CardapioAgent:${agentId}] Erro em cardapio/getMenuDetails:`, error);
+    // Re-throw error se for um erro já formatado ou um erro inesperado
+    if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
+        throw error;
+    }
+    throw { code: -32000, message: 'Erro interno do servidor ao processar getMenuDetails.' };
   }
-  throw { code: 1001, message: `Cardápio com ID '${menuId}' não encontrado.`, data: { requestedMenuId: menuId } };
 };
 
 /**
@@ -57,6 +77,9 @@ const handleMessageStream: A2AMethodHandler = async (params: any, agentId: strin
   console.log(`[CardapioAgent:${agentId}] Recebido message/stream:`, params);
   const { type, itemId, newStockStatus, available, promoId, active, promotionDetails } = params;
 
+  // Adicionando um ID para o ack, se disponível nos params (ex: um ID de evento do stream)
+  const streamEventId = params.eventId || null;
+
   if (type === 'stock_update' && itemId && newStockStatus !== undefined) {
     const menuItem = menuDatabase['menu-123']?.items.find((item: any) => item.id === itemId);
     if (menuItem) {
@@ -65,32 +88,35 @@ const handleMessageStream: A2AMethodHandler = async (params: any, agentId: strin
         menuItem.available = available;
       }
       console.log(`[CardapioAgent:${agentId}] Item ${itemId} atualizado para stockStatus: ${newStockStatus}, available: ${menuItem.available}`);
-      return { status: 'success', message: `Item ${itemId} stock atualizado.` };
+      return { status: 'received', processed: true, eventAck: streamEventId };
     }
-    return { status: 'error', message: `Item ${itemId} não encontrado para atualização de estoque.` };
+    // Mesmo em caso de erro de processamento, o stream foi 'recebido'.
+    // O erro pode ser logado ou tratado de outra forma, mas o ack informa que chegou.
+    console.error(`[CardapioAgent:${agentId}] Item ${itemId} não encontrado para atualização de estoque via stream.`);
+    return { status: 'received', processed: false, error: `Item ${itemId} não encontrado`, eventAck: streamEventId };
   } else if (type === 'promotion_update' && promoId) {
     console.log(`[CardapioAgent:${agentId}] Recebida atualização de promoção '${promoId}':`, params);
     if (itemId) { // Promoção específica para um item
       const menuItem = menuDatabase['menu-123']?.items.find((item: any) => item.id === itemId);
       if (menuItem) {
         menuItem.activePromotionId = active ? promoId : null;
-        // menuItem.promotionDetails = active ? promotionDetails : null; // Opcional: armazenar mais detalhes
         console.log(`[CardapioAgent:${agentId}] Promoção ${promoId} (ativa: ${active}) atualizada para o item ${itemId}.`);
-        return { status: 'success', message: `Promoção ${promoId} atualizada para item ${itemId}.` };
+        return { status: 'received', processed: true, eventAck: streamEventId };
       }
-      return { status: 'error', message: `Item ${itemId} não encontrado para atualização de promoção.` };
-    } else { // Promoção geral ou que afeta múltiplos itens (lógica mais complexa não implementada aqui)
-      // Exemplo: atualizar uma lista de promoções gerais ativas
+      console.error(`[CardapioAgent:${agentId}] Item ${itemId} não encontrado para atualização de promoção via stream.`);
+      return { status: 'received', processed: false, error: `Item ${itemId} não encontrado para promoção`, eventAck: streamEventId };
+    } else { // Promoção geral
       if (active) {
         menuDatabase['menu-123'].activeGeneralPromotions[promoId] = promotionDetails || { active: true };
       } else {
         delete menuDatabase['menu-123'].activeGeneralPromotions[promoId];
       }
       console.log(`[CardapioAgent:${agentId}] Promoção geral ${promoId} (ativa: ${active}) atualizada.`);
-      return { status: 'success', message: `Promoção geral ${promoId} atualizada.` };
+      return { status: 'received', processed: true, eventAck: streamEventId };
     }
   }
-  return { status: 'warning', message: 'Tipo de stream não reconhecido ou dados insuficientes.' };
+  console.warn(`[CardapioAgent:${agentId}] Tipo de stream não reconhecido ou dados insuficientes:`, params);
+  return { status: 'received', processed: false, error: 'Tipo de stream não reconhecido ou dados insuficientes.', eventAck: streamEventId };
 };
 
 /**
@@ -142,31 +168,13 @@ const handleAuthenticatedExtendedCard: A2AMethodHandler = async (params: any, ag
 
 export const CardapioAgent = {
   initialize: () => {
-    registerA2AMethod(`${AGENT_ID_PREFIX}/message/send`, handleMessageSend);
-    registerA2AMethod(`${AGENT_ID_PREFIX}/message/stream`, handleMessageStream); // Para receber streams
-    registerA2AMethod(`${AGENT_ID_PREFIX}/cardapio/getMenuDetails`, handleGetMenuDetails);
-    registerA2AMethod(`${AGENT_ID_PREFIX}/tasks/get`, handleTasksGet);
-    registerA2AMethod(`${AGENT_ID_PREFIX}/agent/authenticatedExtendedCard`, handleAuthenticatedExtendedCard);
-    // Poderia ser apenas 'message/send', etc., se o roteamento no core handler for mais genérico
-    // e usar o agentId para diferenciar. A estrutura atual do handler.ts não diferencia por agentId no registro.
-    // Para simplificar, vamos assumir que os métodos são registrados globalmente por enquanto
-    // e o `agentId` no `processA2ARequest` é usado para direcionar a lógica dentro do handler.
-    // Ou, cada agente registra métodos prefixados com seu tipo, ex: 'cardapio/getMenu'
+    registerA2AMethod('cardapio/message/send', handleMessageSend);
+    registerA2AMethod('cardapio/message/stream', handleMessageStream);
+    registerA2AMethod('cardapio/getMenuDetails', handleGetMenuDetails);
+    registerA2AMethod('cardapio/tasks/get', handleTasksGet);
+    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard); // Sem prefixo
 
-    // Registro dos métodos com nomes mais genéricos para serem usados pelo handler central
-    // O handler central usará o `agentId` da URL para saber qual agente está sendo chamado.
-    // Se o `agentType` da URL (ex: /api/v1/a2a/cardapio/{agent-id}) for usado para rotear para este módulo,
-    // então os métodos podem ser registrados sem prefixo específico do agente.
-
-    // Exemplo de registro para o handler central (assumindo que o a2aServer.ts importa e chama initialize())
-    // Estes são os métodos que o CardapioAgent expõe.
-    registerA2AMethod('message/send', handleMessageSend); // Genérico, o handler decide se é para este agente
-    registerA2AMethod('message/stream', handleMessageStream); // Genérico
-    registerA2AMethod('cardapio/getMenuDetails', handleGetMenuDetails); // Específico do cardápio
-    registerA2AMethod('tasks/get', handleTasksGet); // Genérico
-    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard); // Genérico
-
-    console.log('[CardapioAgent] Métodos A2A registrados.');
+    console.log('[CardapioAgent] Métodos A2A registrados com prefixo "cardapio/".');
   }
 };
 

@@ -1,5 +1,6 @@
 import { registerA2AMethod, A2AMethodHandler } from '@/a2a/core/handler';
 import { A2AMessageSendParams, A2AMessage, A2AMessagePart, A2AAgentProfile } from '@/types/integrations';
+import { z } from 'zod';
 
 const AGENT_ID_PREFIX = 'estoque-agent';
 
@@ -27,25 +28,42 @@ const handleMessageSend: A2AMethodHandler = async (params: A2AMessageSendParams,
 /**
  * Handler para o método A2A 'tasks/get' para consultar disponibilidade de um item.
  */
-const handleTasksGet: A2AMethodHandler = async (params: { itemId?: string }, agentId: string) => {
-  console.log(`[EstoqueAgent:${agentId}] Chamado tasks/get com params:`, params);
-  if (!params.itemId) {
-    throw { code: 2001, message: 'Parâmetro itemId é obrigatório para tasks/get no EstoqueAgent.' };
+const TasksGetParamsSchema = z.object({
+  itemId: z.string(), // itemId é obrigatório
+  // Adicionar outros campos se forem relevantes para tasks/get do EstoqueAgent
+});
+
+const handleTasksGet: A2AMethodHandler = async (params: unknown, agentId: string) => {
+  try {
+    const validatedParams = TasksGetParamsSchema.parse(params);
+    console.log(`[EstoqueAgent:${agentId}] Chamado tasks/get com params:`, validatedParams);
+    
+    const item = inventoryDatabase[validatedParams.itemId];
+    if (item) {
+      return {
+        taskId: `task-estoque-${validatedParams.itemId}`,
+        status: 'completed', // Simulado
+        result: {
+          itemId: item.id,
+          quantity: item.quantity,
+          status: item.status,
+          available: item.quantity > 0,
+        }
+      };
+    }
+    throw { code: 2002, message: `Item com ID '${validatedParams.itemId}' não encontrado no estoque.` };
+
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error(`[EstoqueAgent:${agentId}] Erro de validação em tasks/get:`, error.errors);
+      throw { code: -32602, message: 'Parâmetros inválidos.', data: error.format() };
+    }
+    console.error(`[EstoqueAgent:${agentId}] Erro em tasks/get:`, error);
+    if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
+        throw error;
+    }
+    throw { code: -32000, message: 'Erro interno do servidor ao processar tasks/get no EstoqueAgent.' };
   }
-  const item = inventoryDatabase[params.itemId];
-  if (item) {
-    return {
-      taskId: `task-estoque-${params.itemId}`,
-      status: 'completed', // Simulado
-      result: {
-        itemId: item.id,
-        quantity: item.quantity,
-        status: item.status,
-        available: item.quantity > 0,
-      }
-    };
-  }
-  throw { code: 2002, message: `Item com ID '${params.itemId}' não encontrado no estoque.` };
 };
 
 /**
@@ -64,9 +82,14 @@ const handleMessageStreamReceive: A2AMethodHandler = async (params: any, agentId
  * Função para simular o envio de uma atualização de estoque via message/stream para outro agente (ex: CardapioAgent).
  * Esta não é um handler de método A2A de entrada, mas uma lógica interna do agente.
  */
-export const sendStockUpdateToCardapioAgent = async (itemId: string, newQuantity: number) => {
+import { a2aClient } from '@/a2a/core/a2aClient'; // Importar o a2aClient
+
+export const sendStockUpdateToCardapioAgent = async (itemId: string, newQuantity: number, agentId: string = 'estoque-principal') => {
   const item = inventoryDatabase[itemId];
-  if (!item) return;
+  if (!item) {
+    console.error(`[EstoqueAgent:${agentId}] Item ${itemId} não encontrado para enviar atualização de estoque.`);
+    return;
+  }
 
   item.quantity = newQuantity;
   if (newQuantity === 0) item.status = 'unavailable';
@@ -74,17 +97,29 @@ export const sendStockUpdateToCardapioAgent = async (itemId: string, newQuantity
   else item.status = 'available';
 
   const updatePayload = {
+    type: 'stock_update', // Tipo de evento para o CardapioAgent
+    eventId: `stock-${itemId}-${Date.now()}`, // ID único para o evento de stream
     itemId: item.id,
     newStockStatus: item.status,
     available: item.quantity > 0,
     quantity: item.quantity
   };
 
-  console.log(`[EstoqueAgent] Simulando envio de message/stream para CardapioAgent:`, updatePayload);
-  // Em uma implementação real, aqui ocorreria uma chamada HTTP POST para o endpoint A2A do CardapioAgent
-  // com o método 'message/stream' e o payload acima.
-  // Ex: await a2aClient.sendStream('cardapio-agent-instance-id', 'message/stream', updatePayload);
-  // Por agora, apenas logamos a intenção.
+  console.log(`[EstoqueAgent:${agentId}] Enviando message/stream para CardapioAgent:`, updatePayload);
+  
+  try {
+    // O targetAgentId 'cardapio-principal' é um exemplo.
+    // Em um sistema real, este ID seria configurável ou descoberto.
+    const response = await a2aClient.sendStream(
+      'cardapio', 
+      'cardapio-principal', 
+      updatePayload
+    );
+    console.log(`[EstoqueAgent:${agentId}] Resposta do CardapioAgent ao stream de estoque:`, response);
+  } catch (error) {
+    console.error(`[EstoqueAgent:${agentId}] Erro ao enviar atualização de estoque para CardapioAgent para item ${itemId}:`, error);
+    // Considerar estratégias de retry ou fallback se a comunicação falhar.
+  }
 };
 
 
@@ -99,9 +134,9 @@ const handleAuthenticatedExtendedCard: A2AMethodHandler = async (params: any, ag
     name: 'EstoqueAgent - Gerenciador de Estoque',
     description: 'Monitora ingredientes e disponibilidade de produtos, notificando outros agentes sobre mudanças.',
     capabilities: [
-      { method: 'message/send', description: 'Para consultas gerais sobre o estoque.' },
-      { method: 'tasks/get', description: 'Consulta disponibilidade e status de itens específicos.' },
-      // { method: 'message/stream', description: 'Envia atualizações de estoque em tempo real (este agente é o PRODUTOR do stream).' },
+      { method: 'estoque/message/send', description: 'Para consultas gerais sobre o estoque.' },
+      { method: 'estoque/tasks/get', description: 'Consulta disponibilidade e status de itens específicos.' },
+      // { method: 'estoque/message/stream', description: 'Envia atualizações de estoque em tempo real (este agente é o PRODUTOR do stream).' },
       { method: 'agent/authenticatedExtendedCard', description: 'Retorna o perfil e capacidades deste agente.' },
     ],
   };
@@ -110,14 +145,13 @@ const handleAuthenticatedExtendedCard: A2AMethodHandler = async (params: any, ag
 
 export const EstoqueAgent = {
   initialize: () => {
-    registerA2AMethod('message/send', handleMessageSend); // Genérico, para ser usado pelo handler central
-    registerA2AMethod('tasks/get', handleTasksGet);       // Genérico
-    // O EstoqueAgent primariamente *envia* message/stream, não o registra como um método de entrada comum aqui.
-    // Se ele também precisasse *receber* streams de outros agentes, um handler seria registrado.
-    // registerA2AMethod('message/stream', handleMessageStreamReceive); // Exemplo se recebesse streams
-    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard); // Genérico
+    registerA2AMethod('estoque/message/send', handleMessageSend);
+    registerA2AMethod('estoque/tasks/get', handleTasksGet);
+    // O EstoqueAgent primariamente *envia* message/stream. Se precisasse receber, seria 'estoque/message/stream'.
+    // registerA2AMethod('estoque/message/stream', handleMessageStreamReceive); // Exemplo se recebesse streams
+    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard); // Sem prefixo
 
-    console.log('[EstoqueAgent] Métodos A2A registrados.');
+    console.log('[EstoqueAgent] Métodos A2A registrados com prefixo "estoque/".');
 
     // Simulação de uma mudança no estoque para teste
     // setTimeout(() => sendStockUpdateToCardapioAgent('item-2', 2), 5000);
