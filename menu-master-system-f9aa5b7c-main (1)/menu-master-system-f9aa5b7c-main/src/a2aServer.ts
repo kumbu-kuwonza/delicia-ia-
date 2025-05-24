@@ -5,6 +5,13 @@ import bodyParser from 'body-parser';
 import { processA2ARequest } from './a2a/core/handler';
 
 // Importar aqui os módulos dos agentes para que eles possam registrar seus métodos A2A
+import { CardapioAgent } from './a2a/agents/cardapio/cardapioAgent';
+import { EstoqueAgent } from './a2a/agents/estoque/estoqueAgent';
+import { PromocaoAgent } from './a2a/agents/promocao/promocaoAgent';
+import { PedidosAgent } from './a2a/agents/pedidos/pedidosAgent';
+import { CRMAgent } from './a2a/agents/crm/crmAgent';
+import { AnalyticsAgent } from './a2a/agents/analytics/analyticsAgent';
+import { WhatsAppAgent } from './a2a/agents/whatsapp/whatsappAgent'; // Ajustado para o caminho relativo correto
 // Exemplo: import './a2a/agents/cardapio/cardapioAgent'; // Descomente e crie quando o agente existir
 // Exemplo: import './a2a/agents/estoque/estoqueAgent';
 // ... e assim por diante para todos os agentes
@@ -101,6 +108,13 @@ export const startA2AServer = () => {
   // Aqui, os agentes deveriam registrar seus métodos A2A antes do servidor iniciar.
   // Exemplo: CardapioAgent.registerMethods();
   // Exemplo: EstoqueAgent.registerMethods();
+  CardapioAgent.initialize();
+  EstoqueAgent.initialize();
+  PromocaoAgent.initialize();
+  PedidosAgent.initialize();
+  CRMAgent.initialize();
+  AnalyticsAgent.initialize();
+  WhatsAppAgent.initialize();
 
   app.listen(PORT, () => {
     console.log(`[A2AServer] Servidor A2A rodando na porta ${PORT}`);

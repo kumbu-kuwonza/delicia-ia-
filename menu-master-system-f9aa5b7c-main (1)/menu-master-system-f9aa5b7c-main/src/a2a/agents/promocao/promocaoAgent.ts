@@ -1,5 +1,7 @@
 import { registerA2AMethod, A2AMethodHandler } from '@/a2a/core/handler';
-import { A2AMessageSendParams, A2AAgentProfile, A2AMessage } from '@/types/integrations';
+import { A2AMessageSendParams, A2AAgentProfile, A2AMessage, A2AMessagePart } from '@/types/integrations';
+import { z } from 'zod';
+import { a2aClient } from '@/a2a/core/a2aClient';
 
 const AGENT_ID_PREFIX = 'promocao-agent';
 
@@ -13,110 +15,339 @@ const promotionsDatabase: Record<string, any> = {
  * Handler para o método A2A 'message/send' direcionado ao PromocaoAgent.
  * Usado para criar, atualizar ou gerenciar promoções, ou para receber gatilhos de outros agentes.
  */
-const handleMessageSend: A2AMethodHandler = async (params: A2AMessageSendParams, agentId: string) => {
-  console.log(`[PromocaoAgent:${agentId}] Recebido message/send:`, params.message);
-  const message = params.message;
-  const actionPart = message.parts.find(p => p.type === 'text' && p.text?.startsWith('action:'));
-  const triggerPart = message.parts.find(p => p.type === 'text' && p.text?.startsWith('trigger:'));
-  const payloadPart = message.parts.find(p => p.type === 'json'); // Supondo que os dados/payload vêm como JSON
 
-  // Lógica para gerenciar promoções (criar, atualizar, etc.)
-  if (actionPart?.text === 'action:create_promo' && payloadPart?.json) {
-    const newPromoData = payloadPart.json as any;
-    const newPromoId = `promo-${Date.now()}`;
-    const newPromo = { ...newPromoData, id: newPromoId, active: newPromoData.active !== undefined ? newPromoData.active : false };
-    promotionsDatabase[newPromoId] = newPromo;
-    console.log(`[PromocaoAgent:${agentId}] Promoção '${newPromo.name}' (ID: ${newPromoId}) criada.`);
-    return { responseFor: message.messageId, status: `Promoção ${newPromoId} criada.`, promoId: newPromoId };
+// Schema para criação de promoção
+const CreatePromoPayloadSchema = z.object({
+  name: z.string(),
+  description: z.string(),
+  type: z.enum(['percentage', 'bogo', 'fixed_discount']), // Adicionar outros tipos se necessário
+  value: z.number().optional(), // Obrigatório para percentage e fixed_discount
+  target: z.string().optional(), // Ex: 'category_pizza', 'item_refri_grande'
+  targetType: z.enum(['item', 'category', 'global']).optional(),
+  targetValue: z.string().optional(), // ID do item ou categoria
+  active: z.boolean().optional().default(false),
+  startDate: z.string().datetime().optional(),
+  endDate: z.string().datetime().optional(),
+});
+
+// Schema para o payload JSON dentro de 'parts' para (de)activate_promo e update_promo
+const PromoIdPayloadSchema = z.object({
+  promoId: z.string().min(1, "promoId não pode ser vazio"),
+});
+
+// Schema genérico para A2AMessageSendParams para validação inicial
+const MessageSendParamsSchema = z.object({
+   message: z.custom<A2AMessage>((val) => {
+    // Aqui você pode adicionar uma validação mais robusta para a estrutura A2AMessage se necessário
+    // Por enquanto, apenas verificamos se é um objeto e tem as propriedades messageId, role e parts.
+    return typeof val === 'object' && val !== null &&
+           'messageId' in val && 'role' in val && 'parts' in val && Array.isArray((val as A2AMessage).parts);
+  }),
+});
+
+
+const handleMessageSend: A2AMethodHandler = async (params: unknown, agentId: string) => {
+  const parsedParams = MessageSendParamsSchema.safeParse(params);
+
+  if (!parsedParams.success) {
+    console.error(`[PromocaoAgent:${agentId}] Erro de validação inicial em message/send:`, parsedParams.error.format());
+    // Para erros de estrutura básica da mensagem, lançamos um erro JSON-RPC
+    throw { 
+      code: -32602, 
+      message: 'Estrutura da requisição message/send inválida.', 
+      data: parsedParams.error.format() 
+    };
   }
-  // TODO: Adicionar mais lógicas para 'action:update_promo', 'action:activate_promo', 'action:deactivate_promo'
+  const message = parsedParams.data.message;
+  console.log(`[PromocaoAgent:${agentId}] Recebido message/send:`, message);
 
-  // Lógica para receber gatilhos (ex: de AnalyticsAgent para promoções automáticas)
-  if (triggerPart && payloadPart?.json) {
-    const triggerData = payloadPart.json as any;
-    console.log(`[PromocaoAgent:${agentId}] Recebido gatilho '${triggerPart.text}' com dados:`, triggerData);
+  try {
+    const actionPart = message.parts.find(p => p.type === 'text' && p.text?.startsWith('action:'));
+    const triggerPart = message.parts.find(p => p.type === 'text' && p.text?.startsWith('trigger:'));
+    const payloadPart = message.parts.find(p => p.type === 'json');
 
-    if (triggerPart.text === 'trigger:low_sales_item') {
-      const itemToPromote = triggerData.itemId;
-      if (!itemToPromote) {
-        console.warn(`[PromocaoAgent:${agentId}] Gatilho 'low_sales_item' recebido sem itemId.`);
-        return { responseFor: message.messageId, error: 'Gatilho low_sales_item sem itemId.' };
+    // Lógica para gerenciar promoções (criar, atualizar, etc.)
+    if (actionPart?.text === 'action:create_promo') {
+      if (!payloadPart || !payloadPart.json) {
+        // Lançar erro JSON-RPC compatível
+        throw { code: -32602, message: 'Payload JSON é obrigatório para action:create_promo.' };
       }
+      const validatedPayload = CreatePromoPayloadSchema.parse(payloadPart.json);
+      const newPromoId = `promo-${Date.now()}`;
+      const newPromo = { ...validatedPayload, id: newPromoId };
+      promotionsDatabase[newPromoId] = newPromo;
+      console.log(`[PromocaoAgent:${agentId}] Promoção '${newPromo.name}' (ID: ${newPromoId}) criada.`);
       
-      let promotionActivatedOrCreated = false;
-      // Tenta ativar uma promoção existente para o item alvo que esteja inativa
-      for (const promoId in promotionsDatabase) {
-        const promo = promotionsDatabase[promoId];
-        if ((promo.target === itemToPromote || promo.target === `item_${itemToPromote}` || (promo.targetType === 'item' && promo.targetValue === itemToPromote)) && !promo.active) {
-          promo.active = true;
-          console.log(`[PromocaoAgent:${agentId}] Promoção existente '${promo.name}' (ID: ${promo.id}) ativada para o item ${itemToPromote}.`);
-          // TODO: Enviar message/send ou message/stream para CardapioAgent para refletir a promoção no cardápio.
-          // Ex: await a2aClient.sendMessage('cardapio-agent-default', 'message/stream', { type: 'promotion_update', promoId: promo.id, active: true, itemId: itemToPromote });
-          promotionActivatedOrCreated = true;
-          return { responseFor: message.messageId, status: `Promoção ${promo.id} ativada para ${itemToPromote}.` };
+      if (newPromo.active) {
+        // Notificar CardapioAgent se a promoção for criada ativa
+        try {
+          await a2aClient.sendStream(
+            'cardapio', 'cardapio-principal',
+            { 
+              type: 'promotion_update', promoId: newPromo.id, active: true, 
+              itemId: newPromo.targetType === 'item' ? newPromo.targetValue : undefined,
+              promotionDetails: newPromo, eventId: `promo-create-${newPromo.id}-${Date.now()}`
+            }
+          );
+          console.log(`[PromocaoAgent:${agentId}] Notificação de NOVA promoção ATIVA enviada para CardapioAgent para promoId: ${newPromo.id}`);
+        } catch (clientError) {
+          console.error(`[PromocaoAgent:${agentId}] Erro ao notificar CardapioAgent sobre nova promoção ativa ${newPromo.id}:`, clientError);
         }
       }
-
-      // Se nenhuma promoção existente foi ativada, cria uma nova promoção automática
-      if (!promotionActivatedOrCreated) {
-        const autoPromoId = `auto-promo-${itemToPromote.replace(/[^a-zA-Z0-9]/g, '')}-${Date.now()}`;
-        const autoPromo = {
-          id: autoPromoId,
-          name: `Promoção Automática para ${triggerData.itemName || itemToPromote}`,
-          description: `Desconto especial para ${triggerData.itemName || itemToPromote} devido à baixa saída. (Gerado automaticamente)`,
-          type: 'percentage', // Exemplo de tipo de promoção
-          value: 15, // Exemplo de valor (15%)
-          target: itemToPromote, // Ou targetType: 'item', targetValue: itemToPromote
-          targetType: 'item',
-          targetValue: itemToPromote,
-          active: true,
-          autoGenerated: true,
-          startDate: new Date().toISOString(),
-          // endDate: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString(), // Ex: válida por 7 dias
-        };
-        promotionsDatabase[autoPromoId] = autoPromo;
-        console.log(`[PromocaoAgent:${agentId}] Nova promoção automática '${autoPromo.name}' (ID: ${autoPromoId}) criada e ativada para o item ${itemToPromote}.`);
-        // TODO: Enviar message/send ou message/stream para CardapioAgent
-        return { responseFor: message.messageId, status: `Nova promoção automática ${autoPromoId} criada e ativada para ${itemToPromote}.`, promoId: autoPromoId };
-      }
+      return { responseFor: message.messageId, status: `Promoção ${newPromoId} criada.`, promoId: newPromoId };
     }
-    // Adicionar outros tipos de gatilhos aqui (ex: 'trigger:customer_segment_opportunity')
-    return { responseFor: message.messageId, reply: `Gatilho '${triggerPart.text}' processado.` };
-  }
+    
+    // Lógica para ativar/desativar promoção
+    if (actionPart?.text === 'action:activate_promo' || actionPart?.text === 'action:deactivate_promo') {
+      if (!payloadPart || !payloadPart.json) {
+        throw { code: -32602, message: 'Payload JSON é obrigatório para esta ação.' };
+      }
 
-  return { responseFor: message.messageId, reply: 'Ação de promoção ou gatilho não reconhecido, ou dados insuficientes.' };
+      const { promoId } = PromoIdPayloadSchema.parse(payloadPart.json);
+      const promotion = promotionsDatabase[promoId];
+
+      if (!promotion) {
+        // Lançar erro JSON-RPC compatível
+        throw { code: 6001, message: `Promoção com ID '${promoId}' não encontrada.` };
+      }
+
+      const newStatus = actionPart.text === 'action:activate_promo';
+      if (promotion.active === newStatus) {
+        return { 
+          responseFor: message.messageId, 
+          status: `Promoção ${promoId} já está ${newStatus ? 'ativa' : 'inativa'}.` 
+        };
+      }
+
+      promotion.active = newStatus;
+      console.log(`[PromocaoAgent:${agentId}] Promoção '${promotion.name}' (ID: ${promoId}) foi ${newStatus ? 'ATIVADA' : 'DESATIVADA'}.`);
+
+      // Notificar CardapioAgent sobre a mudança
+      try {
+        await a2aClient.sendStream(
+          'cardapio', 
+          'cardapio-principal', 
+          {
+            type: 'promotion_update',
+            promoId: promoId,
+            active: newStatus,
+            itemId: promotion.targetType === 'item' ? promotion.targetValue : undefined,
+            // Se a promoção for desativada, talvez não precise enviar promotionDetails, ou enviar um subconjunto.
+            promotionDetails: newStatus ? promotion : { id: promoId, active: newStatus }, 
+            eventId: `promo-status-${promoId}-${Date.now()}`
+          }
+        );
+        console.log(`[PromocaoAgent:${agentId}] Notificação de status da promoção (${newStatus ? 'ATIVA' : 'INATIVA'}) enviada para CardapioAgent para promoId: ${promoId}`);
+      } catch (clientError) {
+        console.error(`[PromocaoAgent:${agentId}] Erro ao notificar CardapioAgent sobre status da promoção ${promoId}:`, clientError);
+      }
+
+      return { 
+        responseFor: message.messageId, 
+        status: `Promoção ${promoId} ${newStatus ? 'ativada' : 'desativada'} com sucesso.` 
+      };
+    }
+    
+    // Lógica para ativar/desativar promoção
+    if (actionPart?.text === 'action:activate_promo' || actionPart?.text === 'action:deactivate_promo') {
+      if (!payloadPart || !payloadPart.json) {
+        throw { code: -32602, message: 'Payload JSON é obrigatório para esta ação.' };
+      }
+
+      const { promoId } = PromoIdPayloadSchema.parse(payloadPart.json);
+      const promotion = promotionsDatabase[promoId];
+
+      if (!promotion) {
+        throw { code: 6001, message: `Promoção com ID '${promoId}' não encontrada.` };
+      }
+
+      const newStatus = actionPart.text === 'action:activate_promo';
+      if (promotion.active === newStatus) {
+        return { 
+          responseFor: message.messageId, 
+          status: `Promoção ${promoId} já está ${newStatus ? 'ativa' : 'inativa'}.` 
+        };
+      }
+
+      promotion.active = newStatus;
+      console.log(`[PromocaoAgent:${agentId}] Promoção '${promotion.name}' (ID: ${promoId}) foi ${newStatus ? 'ATIVADA' : 'DESATIVADA'}.`);
+
+      // Notificar CardapioAgent sobre a mudança
+      try {
+        await a2aClient.sendStream(
+          'cardapio', 
+          'cardapio-principal', 
+          {
+            type: 'promotion_update',
+            promoId: promoId,
+            active: newStatus,
+            itemId: promotion.targetType === 'item' ? promotion.targetValue : undefined,
+            promotionDetails: newStatus ? promotion : { id: promoId, active: newStatus }, 
+            eventId: `promo-status-${promoId}-${Date.now()}`
+          }
+        );
+        console.log(`[PromocaoAgent:${agentId}] Notificação de status da promoção (${newStatus ? 'ATIVA' : 'INATIVA'}) enviada para CardapioAgent para promoId: ${promoId}`);
+      } catch (clientError) {
+        console.error(`[PromocaoAgent:${agentId}] Erro ao notificar CardapioAgent sobre status da promoção ${promoId}:`, clientError);
+      }
+
+      return { 
+        responseFor: message.messageId, 
+        status: `Promoção ${promoId} ${newStatus ? 'ativada' : 'desativada'} com sucesso.` 
+      };
+    }
+    // TODO: Adicionar lógica para 'action:update_promo' com validação Zod
+
+    // Lógica para receber gatilhos (ex: de AnalyticsAgent para promoções automáticas)
+    if (triggerPart && payloadPart?.json) {
+      const triggerData = payloadPart.json as any; // TODO: Validar triggerData com Zod se a estrutura for conhecida
+      console.log(`[PromocaoAgent:${agentId}] Recebido gatilho '${triggerPart.text}' com dados:`, triggerData);
+
+      if (triggerPart.text === 'trigger:low_sales_item') {
+        const itemToPromote = triggerData.itemId; // Supondo que AnalyticsAgent envia itemId
+        if (!itemToPromote) {
+          console.warn(`[PromocaoAgent:${agentId}] Gatilho 'low_sales_item' recebido sem itemId.`);
+          return { responseFor: message.messageId, error: 'Gatilho low_sales_item sem itemId.' };
+        }
+        
+        let promotionActivatedOrCreated = false;
+        for (const promoId in promotionsDatabase) {
+          const promo = promotionsDatabase[promoId];
+          if ((promo.target === itemToPromote || promo.target === `item_${itemToPromote}` || (promo.targetType === 'item' && promo.targetValue === itemToPromote)) && !promo.active) {
+            promo.active = true;
+            console.log(`[PromocaoAgent:${agentId}] Promoção existente '${promo.name}' (ID: ${promo.id}) ativada para o item ${itemToPromote}.`);
+            try {
+              await a2aClient.sendStream(
+                'cardapio', 
+                'cardapio-principal', 
+                { 
+                  type: 'promotion_update', 
+                  promoId: promo.id, 
+                  active: true, 
+                  itemId: itemToPromote, 
+                  promotionDetails: promo,
+                  eventId: `promo-update-${promo.id}-${Date.now()}`
+                }
+              );
+              console.log(`[PromocaoAgent:${agentId}] Notificação de promoção ATIVADA enviada para CardapioAgent para promoId: ${promo.id}`);
+            } catch (clientError) {
+              console.error(`[PromocaoAgent:${agentId}] Erro ao notificar CardapioAgent sobre ativação da promoção ${promo.id}:`, clientError);
+            }
+            promotionActivatedOrCreated = true;
+            return { responseFor: message.messageId, status: `Promoção ${promo.id} ativada para ${itemToPromote}.` };
+          }
+        }
+
+        if (!promotionActivatedOrCreated) {
+          const autoPromoId = `auto-promo-${itemToPromote.replace(/[^a-zA-Z0-9]/g, '')}-${Date.now()}`;
+          const autoPromo = {
+            id: autoPromoId,
+            name: `Promoção Automática para ${triggerData.itemName || itemToPromote}`,
+            description: `Desconto especial para ${triggerData.itemName || itemToPromote}. (Gerado automaticamente)`,
+            type: 'percentage', value: 15, target: itemToPromote, targetType: 'item', targetValue: itemToPromote,
+            active: true, autoGenerated: true, startDate: new Date().toISOString(),
+          };
+          promotionsDatabase[autoPromoId] = autoPromo;
+          console.log(`[PromocaoAgent:${agentId}] Nova promoção automática '${autoPromo.name}' (ID: ${autoPromoId}) criada e ativada para o item ${itemToPromote}.`);
+          try {
+            await a2aClient.sendStream(
+              'cardapio', 
+              'cardapio-principal',
+              { 
+                type: 'promotion_update', 
+                promoId: autoPromo.id, 
+                active: true, 
+                itemId: itemToPromote, 
+                promotionDetails: autoPromo,
+                eventId: `promo-update-${autoPromo.id}-${Date.now()}`
+              }
+            );
+            console.log(`[PromocaoAgent:${agentId}] Notificação de NOVA promoção enviada para CardapioAgent para promoId: ${autoPromo.id}`);
+          } catch (clientError) {
+            console.error(`[PromocaoAgent:${agentId}] Erro ao notificar CardapioAgent sobre nova promoção ${autoPromo.id}:`, clientError);
+          }
+          return { responseFor: message.messageId, status: `Nova promoção automática ${autoPromoId} criada e ativada para ${itemToPromote}.`, promoId: autoPromoId };
+        }
+      }
+      return { responseFor: message.messageId, reply: `Gatilho '${triggerPart.text}' processado.` };
+    }
+
+    // Se nenhuma ação ou gatilho corresponder
+    console.warn(`[PromocaoAgent:${agentId}] Nenhuma ação ou gatilho reconhecido para a mensagem:`, message);
+    throw { code: -32601, message: 'Ação de promoção ou gatilho não reconhecido, ou dados insuficientes.' };
+
+  } catch (error) {
+    // Tratamento de erro aprimorado para retornar erros JSON-RPC
+    if (error instanceof z.ZodError) {
+      console.error(`[PromocaoAgent:${agentId}] Erro de validação Zod em message/send:`, error.errors);
+      throw { 
+        code: -32602, // Invalid params
+        message: 'Parâmetros de payload inválidos para a ação.', 
+        data: error.format() 
+      };
+    }
+    // Se o erro já for um objeto de erro JSON-RPC, propague-o
+    if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
+        throw error;
+    }
+    // Para outros erros inesperados
+    console.error(`[PromocaoAgent:${agentId}] Erro inesperado em message/send:`, error);
+    throw { 
+      code: -32000, // Internal server error
+      message: 'Erro interno do servidor ao processar message/send no PromocaoAgent.' 
+    };
+  }
 };
 
 /**
  * Handler para o método A2A 'tasks/get' para buscar informações sobre promoções.
  */
-const handleTasksGet: A2AMethodHandler = async (params: { promotionId?: string; listActive?: boolean }, agentId: string) => {
-  console.log(`[PromocaoAgent:${agentId}] Chamado tasks/get com params:`, params);
-  if (params.promotionId) {
-    const promotion = promotionsDatabase[params.promotionId];
-    if (promotion) {
+const TasksGetParamsSchema = z.object({
+  promotionId: z.string().optional(),
+  listActive: z.boolean().optional(),
+});
+
+const handleTasksGet: A2AMethodHandler = async (params: unknown, agentId: string) => {
+  try {
+    const validatedParams = TasksGetParamsSchema.parse(params);
+    console.log(`[PromocaoAgent:${agentId}] Chamado tasks/get com params:`, validatedParams);
+
+    if (validatedParams.promotionId) {
+      const promotion = promotionsDatabase[validatedParams.promotionId];
+      if (promotion) {
+        return {
+          taskId: `task-promo-${validatedParams.promotionId}`,
+          status: 'completed',
+          result: promotion
+        };
+      }
+      throw { code: 6001, message: `Promoção com ID '${validatedParams.promotionId}' não encontrada.` };
+    }
+    if (validatedParams.listActive) {
+      const activePromotions = Object.values(promotionsDatabase).filter(p => p.active);
       return {
-        taskId: `task-promo-${params.promotionId}`,
+        taskId: `task-promo-list-active-${Date.now()}`,
         status: 'completed',
-        result: promotion
+        result: activePromotions
       };
     }
-    throw { code: 6001, message: `Promoção com ID '${params.promotionId}' não encontrada.` };
-  }
-  if (params.listActive) {
-    const activePromotions = Object.values(promotionsDatabase).filter(p => p.active);
+    // Retornar todas as promoções por padrão se nenhum filtro específico for fornecido
     return {
-      taskId: `task-promo-list-active-${Date.now()}`,
+      taskId: `task-promo-list-all-${Date.now()}`,
       status: 'completed',
-      result: activePromotions
+      result: Object.values(promotionsDatabase)
     };
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      console.error(`[PromocaoAgent:${agentId}] Erro de validação em tasks/get:`, error.errors);
+      throw { code: -32602, message: 'Parâmetros inválidos para tasks/get.', data: error.format() };
+    }
+    console.error(`[PromocaoAgent:${agentId}] Erro em tasks/get:`, error);
+    if (typeof error === 'object' && error !== null && 'code' in error && 'message' in error) {
+        throw error;
+    }
+    throw { code: -32000, message: 'Erro interno do servidor ao processar tasks/get no PromocaoAgent.' };
   }
-  // Retornar todas as promoções por padrão
-  return {
-    taskId: `task-promo-list-all-${Date.now()}`,
-    status: 'completed',
-    result: Object.values(promotionsDatabase)
-  };
 };
 
 /**
@@ -130,8 +361,8 @@ const handleAuthenticatedExtendedCard: A2AMethodHandler = async (params: any, ag
     name: 'PromocaoAgent - Gerenciador de Promoções Dinâmicas',
     description: 'Gerencia promoções, campanhas e ofertas especiais, com capacidade para personalização e automação.',
     capabilities: [
-      { method: 'message/send', description: 'Para criar, atualizar, ativar ou desativar promoções.' },
-      { method: 'tasks/get', description: 'Para buscar informações sobre promoções ativas ou específicas.' },
+      { method: 'promocao/message/send', description: 'Para criar, atualizar, ativar ou desativar promoções.' },
+      { method: 'promocao/tasks/get', description: 'Para buscar informações sobre promoções ativas ou específicas.' },
       { method: 'agent/authenticatedExtendedCard', description: 'Retorna o perfil e capacidades deste agente.' },
       // Em uma implementação real, poderia ter 'tasks/subscribe' para ser notificado sobre eventos que disparam promoções
     ],
@@ -141,10 +372,10 @@ const handleAuthenticatedExtendedCard: A2AMethodHandler = async (params: any, ag
 
 export const PromocaoAgent = {
   initialize: () => {
-    registerA2AMethod('message/send', handleMessageSend);
-    registerA2AMethod('tasks/get', handleTasksGet);
-    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard);
-    console.log('[PromocaoAgent] Métodos A2A registrados.');
+    registerA2AMethod('promocao/message/send', handleMessageSend);
+    registerA2AMethod('promocao/tasks/get', handleTasksGet);
+    registerA2AMethod('agent/authenticatedExtendedCard', handleAuthenticatedExtendedCard); // Sem prefixo
+    console.log('[PromocaoAgent] Métodos A2A registrados com prefixo "promocao/".');
   }
 };
 

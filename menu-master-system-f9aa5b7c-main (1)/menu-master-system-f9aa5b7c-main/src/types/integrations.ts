@@ -129,39 +129,3 @@ export interface A2AAgentProfile {
 }
 
 // Fim das Estruturas Genéricas A2A v0.3.0
-
-export interface EvoAIAgentInfo {
-  name: string;
-  description: string;
-  url: string;
-  provider: {
-    organization: string;
-    url: string;
-  };
-  version: string;
-  documentationUrl: string;
-  capabilities: {
-    streaming: boolean;
-    pushNotifications: boolean;
-    stateTransitionHistory: boolean;
-  };
-  securitySchemes: {
-    apiKey: {
-      type: string;
-      in: string;
-      name: string;
-    };
-  };
-  security: Array<{[key: string]: any[]}>;
-  defaultInputModes: string[];
-  defaultOutputModes: string[];
-  skills: Array<{
-    id: string;
-    name: string;
-    description: string;
-    tags: string[];
-    examples: string[];
-    inputModes: string[];
-    outputModes: string[];
-  }>;
-}

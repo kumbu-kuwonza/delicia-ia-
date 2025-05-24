@@ -25,13 +25,13 @@ export const registerA2AMethod = (methodName: string, handler: A2AMethodHandler)
  * @returns true se a chave for válida, false caso contrário.
  */
 const isValidApiKey = (apiKey?: string): boolean => {
-  // Lógica de validação da API Key (placeholder)
-  // Deveria comparar com chaves armazenadas de forma segura
   if (!apiKey) return false;
-  // Exemplo: verificar se a chave existe em uma lista de chaves válidas
-  // const VALID_API_KEYS = ['secret-key-1', 'secret-key-2'];
-  // return VALID_API_KEYS.includes(apiKey);
-  return apiKey.startsWith('sk-'); // Simples placeholder
+  // TODO: EM PRODUÇÃO, ESTAS CHAVES DEVEM VIR DE VARIÁVEIS DE AMBIENTE OU UM SERVIÇO DE CONFIGURAÇÃO SEGURO.
+  const VALID_API_KEYS = [
+    'sk-super-secret-key-admin', 
+    'sk-another-valid-key-for-service-x'
+  ];
+  return VALID_API_KEYS.includes(apiKey);
 };
 
 /**
